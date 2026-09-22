@@ -221,7 +221,10 @@ class Estimator
                 int j = (int) J_pos.start_idx + i - RCP_st_id;
                 if (j >= 0) {
                     Hi.block(0, j*6, 1, 3) = pt_data.normvec.transpose() * J_pos.d_val_d_knot[i];
-                    Hi.block(0, j*6 + 3, 1, 3) = tmp * J_ortdel.d_val_d_knot[i];
+                    for (int column = 0; column < 3; ++column) {
+                        Hi(0, j * 6 + 3 + column) = tmp.dot(
+                            J_ortdel.d_val_d_knot[i].col(column));
+                    }
                 }
             }  
             pt_data.H = Hi.template leftCols<24>();

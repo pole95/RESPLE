@@ -168,7 +168,9 @@ class MappingBase
                 static_cast<int64_t>(std::floor(point.y / map_voxel_resolution_)),
                 static_cast<int64_t>(std::floor(point.z / map_voxel_resolution_)));
             auto [it, inserted] = map_points_.emplace(key, MapPoint{point.x, point.y, point.z});
-            if (!inserted && point.z < it->second.z) it->second = point;
+            if (!inserted && point.z < it->second.z) {
+                it->second = MapPoint{point.x, point.y, point.z};
+            }
         }
     }
 
@@ -218,7 +220,7 @@ class MappingBase
         sensor_msgs::msg::PointCloud2 message;
         pcl::toROSMsg(map, message);
         message.header.frame_id = map_frame_;
-        message.header.stamp = rclcpp::Time(scan_time_ns).to_msg();
+        message.header.stamp = rclcpp::Time(scan_time_ns);
         pub_global_map->publish(message);
         return true;
     }
