@@ -239,8 +239,10 @@ The source code is released under [GPLv3](https://www.gnu.org/licenses/) license
 
 ### M445 excavator
 
-`ros2 launch resple resple_excavator.launch.py` starts RESPLE and Mapping with
-`resple/config/resple_excavator.yaml`. Pass `use_sim_time:=true` in Newton.
+`ros2 launch resple resple_excavator.launch.py config_file:=$(ros2 pkg prefix m4_bringup)/share/m4_bringup/config/common/resple_excavator.yaml`
+starts RESPLE and Mapping. The M445 config is installed at
+`m4_bringup/config/common/resple_excavator.yaml`; both the basic stack and
+standalone Newton pass it to this launch. Pass `use_sim_time:=true` in Newton.
 The config reads the self-filtered Mid-360 PointCloud2 and `/hal/box_imu`.
 Its LiDAR extrinsics follow the M445 URDF. The Mid-360 subscriptions accept
 sensor QoS, so the excavator's filtered cloud and IMU connect directly.
