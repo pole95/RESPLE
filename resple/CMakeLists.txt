@@ -22,6 +22,7 @@ find_package(Eigen3 REQUIRED)
 find_package(ament_lint_auto REQUIRED)
 find_package(PCL REQUIRED)
 find_package(pcl_conversions REQUIRED)
+find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(OpenMP REQUIRED)
 include(FindOpenMP)
@@ -54,6 +55,7 @@ add_executable(RESPLE src/RESPLE.cpp include/ikd-Tree/ikd_Tree.cpp)
 	estimate_msgs
 	pcl_conversions
 	ament_lint_auto
+	tf2
 	tf2_ros
 )
 target_link_libraries(RESPLE

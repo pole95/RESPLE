@@ -236,3 +236,19 @@ Thanks for [SFUISE](https://github.com/ASIG-X/SFUISE), [ikd-Tree](https://github
 
 ## License
 The source code is released under [GPLv3](https://www.gnu.org/licenses/) license. For commercial use, please contact Ziyu Cao at <ziyu.cao@liu.se> or Kailai Li at <kailai.li@liu.se> to discuss an alternative license.
+
+### M445 excavator
+
+`ros2 launch resple resple_excavator.launch.py` starts RESPLE and Mapping with
+`resple/config/resple_excavator.yaml`. Pass `use_sim_time:=true` in Newton.
+The config reads the self-filtered Mid-360 PointCloud2 and `/hal/box_imu`.
+Its LiDAR extrinsics follow the M445 URDF. The Mid-360 subscriptions accept
+sensor QoS, so the excavator's filtered cloud and IMU connect directly.
+
+With `publish_accumulated_map: true`, Mapping keeps one lowest point per
+configured 3D voxel and publishes complete point-map snapshots at the
+configured period (1 Hz for M445). It aligns its internal `world` coordinates
+to the machine's `map` frame using the RESPLE spline pose and the machine's
+`map` to `imu_box_link` transform. The output topic is
+`/m4/lidar/point_cloud_map`; `/m4/lidar/clear_points` clears it. Other launch
+configurations retain the original per-scan `/global_map` behavior.

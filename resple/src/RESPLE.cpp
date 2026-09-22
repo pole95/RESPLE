@@ -52,7 +52,9 @@ public:
         readParameters(nh);
         if (!if_lidar_only) {
             std::string imu_type = CommonUtils::readParam<std::string>(nh, "topic_imu");
-            sub_imu = nh->create_subscription<sensor_msgs::msg::Imu>(imu_type, 2000000, std::bind(&RESPLE::getImuCallback, this, std::placeholders::_1));
+            sub_imu = nh->create_subscription<sensor_msgs::msg::Imu>(
+                imu_type, rclcpp::SensorDataQoS(),
+                std::bind(&RESPLE::getImuCallback, this, std::placeholders::_1));
         }        
         pub_est = nh->create_publisher<estimate_msgs::msg::Estimate>("est_window", 50);
         pub_start_time = nh->create_publisher<std_msgs::msg::Int64>("start_time", 50);
@@ -89,7 +91,8 @@ public:
                         lidar.topic, 200000, std::bind(&RESPLE::hesaiLidarCallback, this, std::placeholders::_1));
             } else if (!lidar.type.compare("Mid360Boxi")) {
                 sub_livox_mid360_boxi = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
-                        lidar.topic, 200000, std::bind(&RESPLE::livoxMid360BoxiCallback, this, std::placeholders::_1));
+                        lidar.topic, rclcpp::SensorDataQoS(),
+                        std::bind(&RESPLE::livoxMid360BoxiCallback, this, std::placeholders::_1));
             }
         }        
     }

@@ -15,10 +15,19 @@ which is included as part of this source code package.
 #include <pcl/io/pcd_io.h>
 #include <pcl/features/normal_3d.h>
 #include <pcl/filters/voxel_grid.h>
+#include <algorithm>
+#include <cstdint>
 #include <thread>
 #include <iostream>
 #include <queue>
 #include <string>
+#include <map>
+#include <tuple>
+#include <cmath>
+#include <mutex>
+#include <limits>
+#include <stdexcept>
+#include <memory>
 #include <sensor_msgs/msg/point_cloud.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/path.hpp>
@@ -27,14 +36,22 @@ which is included as part of this source code package.
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2/exceptions.h>
 #include <rclcpp/service.hpp>
 #include <std_srvs/srv/empty.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include "livox_ros_driver/msg/custom_msg.hpp"
 #include "livox_ros_driver2/msg/custom_msg.hpp"
 #include "livox_interfaces/msg/custom_msg.hpp"
 #include "estimate_msgs/msg/calib.hpp"
 #include "estimate_msgs/msg/estimate.hpp"
 #include "SplineState.h"
+
+struct MapPoint {
+    float x, y, z;
+};
 
 template<typename PointType>
 class MappingBase
@@ -43,9 +60,43 @@ class MappingBase
 
     std::mutex mtx;    
     LidarConfig lidar;
-    MappingBase(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config) : lidar(lidar_config)
+    MappingBase(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config) : lidar(lidar_config), node_(nh)
     {
-        pub_global_map = nh->create_publisher<sensor_msgs::msg::PointCloud2>("global_map", 2);
+        accumulate_map_ = CommonUtils::readParam<bool>(nh, "publish_accumulated_map", false);
+        const auto map_topic = CommonUtils::readParam<std::string>(nh, "global_map_topic", "global_map");
+        map_frame_ = CommonUtils::readParam<std::string>(nh, "global_map_frame", "world");
+        machine_imu_frame_ = CommonUtils::readParam<std::string>(nh, "machine_imu_frame", "imu_box_link");
+        map_voxel_resolution_ = CommonUtils::readParam<double>(nh, "global_map_voxel_resolution", 0.2);
+        const auto publish_period = CommonUtils::readParam<double>(nh, "global_map_publish_period", 1.0);
+        if (accumulate_map_ && (map_frame_.empty() || machine_imu_frame_.empty() ||
+            !std::isfinite(map_voxel_resolution_) || map_voxel_resolution_ <= 0.0 ||
+            !std::isfinite(publish_period) || publish_period < 1e-9 ||
+            publish_period >= static_cast<double>(std::numeric_limits<int64_t>::max()) / 1e9)) {
+            throw std::invalid_argument("Invalid accumulated map frame, resolution, or publish period");
+        }
+        map_publish_interval_ns_ = static_cast<int64_t>(1e9 * publish_period);
+        pub_global_map = nh->create_publisher<sensor_msgs::msg::PointCloud2>(
+            map_topic, accumulate_map_ ? rclcpp::QoS(1).reliable().transient_local() : rclcpp::QoS(2));
+        if (accumulate_map_) {
+            tf_buffer_ = std::make_unique<tf2_ros::Buffer>(nh->get_clock());
+            tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+            const auto clear_service_name = CommonUtils::readParam<std::string>(
+                nh, "global_map_clear_service", "/m4/lidar/clear_points");
+            clear_service_ = nh->create_service<std_srvs::srv::Trigger>(
+                clear_service_name,
+                [this](std_srvs::srv::Trigger::Request::SharedPtr,
+                       std_srvs::srv::Trigger::Response::SharedPtr response) {
+                    std::lock_guard<std::mutex> lock(map_mutex_);
+                    const auto removed = map_points_.size();
+                    map_points_.clear();
+                    sensor_msgs::msg::PointCloud2 empty;
+                    empty.header.frame_id = map_frame_;
+                    empty.header.stamp = node_->now();
+                    pub_global_map->publish(empty);
+                    response->success = true;
+                    response->message = "Cleared " + std::to_string(removed) + " map points";
+                });
+        }
         ds_filter_each_scan.setLeafSize(0.2, 0.2, 0.2);
         pc_last.reset(new typename pcl::PointCloud<PointType>());
         pc_last_ds.reset(new typename pcl::PointCloud<PointType>());
@@ -66,7 +117,15 @@ class MappingBase
                 transformCloud(pc_L_buff.front(), spl, pc);
                 pc_L_buff.pop_front();
                 mtx.unlock();                
-                publishMap(pc, pub_global_map);
+                if (accumulate_map_) {
+                    accumulateScan(*pc);
+                    if (t_end_ns >= last_map_publish_ns_ + map_publish_interval_ns_ &&
+                        publishAccumulatedMap(spl, t_end_ns)) {
+                        last_map_publish_ns_ = t_end_ns;
+                    }
+                } else {
+                    publishMap(pc, pub_global_map);
+                }
             } else {
                 mtx.unlock(); 
                 rate.sleep();
@@ -86,6 +145,83 @@ class MappingBase
 
   private:
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_global_map;
+    rclcpp::Node::SharedPtr node_;
+    bool accumulate_map_ = false;
+    std::string map_frame_, machine_imu_frame_;
+    double map_voxel_resolution_ = 0.2;
+    int64_t map_publish_interval_ns_ = 1000000000;
+    int64_t last_map_publish_ns_ = 0;
+    std::mutex map_mutex_;
+    std::map<std::tuple<int64_t, int64_t, int64_t>, MapPoint> map_points_;
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr clear_service_;
+
+    void accumulateScan(const pcl::PointCloud<PointType>& scan)
+    {
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        for (const auto& point : scan.points) {
+            if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z) ||
+                (point.x == 0.0f && point.y == 0.0f && point.z == 0.0f)) continue;
+            const auto key = std::make_tuple(
+                static_cast<int64_t>(std::floor(point.x / map_voxel_resolution_)),
+                static_cast<int64_t>(std::floor(point.y / map_voxel_resolution_)),
+                static_cast<int64_t>(std::floor(point.z / map_voxel_resolution_)));
+            auto [it, inserted] = map_points_.emplace(key, MapPoint{point.x, point.y, point.z});
+            if (!inserted && point.z < it->second.z) it->second = point;
+        }
+    }
+
+    bool publishAccumulatedMap(SplineState* spl, int64_t scan_time_ns)
+    {
+        geometry_msgs::msg::TransformStamped map_from_imu;
+        int64_t pose_time_ns;
+        try {
+            const auto latest = tf_buffer_->lookupTransform(
+                map_frame_, machine_imu_frame_, rclcpp::Time(0, 0, RCL_ROS_TIME));
+            pose_time_ns = std::min(scan_time_ns, rclcpp::Time(latest.header.stamp).nanoseconds());
+            if (pose_time_ns < spl->minTimeNs() || pose_time_ns > spl->maxTimeNs()) return false;
+            map_from_imu = tf_buffer_->lookupTransform(
+                map_frame_, machine_imu_frame_, rclcpp::Time(pose_time_ns),
+                rclcpp::Duration::from_seconds(0.05));
+        } catch (const tf2::TransformException& error) {
+            RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
+                                 "Waiting for map to %s transform: %s",
+                                 machine_imu_frame_.c_str(), error.what());
+            return false;
+        }
+        Eigen::Quaterniond q_wi;
+        spl->itpQuaternion(pose_time_ns, &q_wi);
+        const Eigen::Vector3d t_wi = spl->itpPosition(pose_time_ns);
+        const auto& rotation = map_from_imu.transform.rotation;
+        const auto& translation = map_from_imu.transform.translation;
+        const Eigen::Quaterniond q_mi(rotation.w, rotation.x, rotation.y, rotation.z);
+        const Eigen::Vector3d t_mi(translation.x, translation.y, translation.z);
+        const Eigen::Quaterniond q_mw = q_mi * q_wi.inverse();
+        const Eigen::Vector3d t_mw = t_mi - q_mw * t_wi;
+
+        std::lock_guard<std::mutex> lock(map_mutex_);
+        pcl::PointCloud<pcl::PointXYZ> map;
+        map.points.reserve(map_points_.size());
+        for (const auto& entry : map_points_) {
+            const auto& point = entry.second;
+            const Eigen::Vector3d p_m = q_mw * Eigen::Vector3d(point.x, point.y, point.z) + t_mw;
+            pcl::PointXYZ transformed;
+            transformed.x = static_cast<float>(p_m.x());
+            transformed.y = static_cast<float>(p_m.y());
+            transformed.z = static_cast<float>(p_m.z());
+            map.points.push_back(transformed);
+        }
+        map.width = static_cast<uint32_t>(map.points.size());
+        map.height = 1;
+        map.is_dense = true;
+        sensor_msgs::msg::PointCloud2 message;
+        pcl::toROSMsg(map, message);
+        message.header.frame_id = map_frame_;
+        message.header.stamp = rclcpp::Time(scan_time_ns).to_msg();
+        pub_global_map->publish(message);
+        return true;
+    }
 
     PointType transformPoint(int64_t time_ns, const SplineState* spl, const PointType& pt_in) const
     {     
@@ -377,7 +513,8 @@ class Mid360BoxiBuff : public MappingBase<pcl::PointXYZINormal>
   Mid360BoxiBuff(rclcpp::Node::SharedPtr &nh, const LidarConfig& lidar_config) : MappingBase<pcl::PointXYZINormal>(nh, lidar_config)
     {
         pc_subscription_mid360 = nh->create_subscription<sensor_msgs::msg::PointCloud2>(
-            this->lidar.topic, 100, std::bind(&Mid360BoxiBuff::mid360BoxiCallback, this, std::placeholders::_1));
+            this->lidar.topic, rclcpp::SensorDataQoS(),
+            std::bind(&Mid360BoxiBuff::mid360BoxiCallback, this, std::placeholders::_1));
     }
 
     void mid360BoxiCallback(const sensor_msgs::msg::PointCloud2::SharedPtr livox_msg_in)
